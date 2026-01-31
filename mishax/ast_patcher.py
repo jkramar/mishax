@@ -19,6 +19,8 @@ import builtins
 from collections.abc import Callable, Mapping, Sequence
 import contextlib
 import dataclasses
+import enum
+import gc
 import importlib
 import inspect
 import os
@@ -26,7 +28,7 @@ import sys
 import tempfile
 import textwrap
 import types
-from typing import ContextManager
+from typing import Any, ContextManager
 from unittest import mock
 import weakref
 
@@ -58,6 +60,232 @@ def _ast_undump(dumped_ast: str) -> ast.AST:
   return eval(dumped_ast, vars(ast) | vars(builtins))  # pylint: disable=eval-used
 
 
+class InPlaceUpdater:
+  """Updates Python objects in-place to use new code without changing identity.
+
+  This enables seamless patching of already-loaded modules by updating existing
+  function code objects, class definitions, and instances to use new patched
+  versions while maintaining object identity.
+
+  Similar to etils ecolab's adhoc in-place reload mode, this handles:
+  - Functions: Updates __code__, __defaults__, __doc__, __dict__, __annotations__
+  - Classes: Updates methods, class attributes, and remaps instances
+  - Enums: Special handling to make old and new enum values compare equal
+  - Properties: Updates fget, fset, fdel functions
+  - Methods: Unwraps to function and updates
+
+  Usage:
+    updater = InPlaceUpdater()
+    for name in ['func1', 'MyClass']:
+      old_obj = getattr(module, name)
+      new_obj = patched_members[name]
+      updater.update(old_obj, new_obj)
+    updater.update_instances()  # Remap all instances to new classes
+  """
+
+  def __init__(self):
+    self._type_updates: dict[type, type] = {}
+
+  def update(self, old: Any, new: Any) -> None:
+    """Updates an object in-place to use new code/definition.
+
+    Args:
+      old: The original object to update.
+      new: The new object with updated code/definition.
+    """
+    if old is new:
+      return
+
+    match old, new:
+      case enum.EnumType(), enum.EnumType():
+        self._update_enum(old, new)
+      case type(), type():
+        self._update_class(old, new)
+      case types.FunctionType(), types.FunctionType():
+        self._update_function(old, new)
+      case types.MethodType(), types.MethodType():
+        self._update_function(old.__func__, new.__func__)
+      case property(), property():
+        self._update_property(old, new)
+
+  def _update_function(
+      self, old: types.FunctionType, new: types.FunctionType
+  ) -> None:
+    """Updates a function's code object and attributes in-place."""
+    for attr in [
+        '__code__',
+        '__defaults__',
+        '__doc__',
+        '__dict__',
+        '__annotations__',
+        '__kwdefaults__',
+    ]:
+      try:
+        new_val = getattr(new, attr)
+        setattr(old, attr, new_val)
+      except (AttributeError, TypeError, ValueError):
+        pass
+
+    # Update __globals__ by clearing and updating the dict
+    # Note: We can't reassign __globals__ directly as it's read-only,
+    # but we can update the dict in-place if it's the same dict.
+    # For AST patching, the new function has different globals, so we
+    # need to be careful here - we update only the code object.
+
+  def _update_class(self, old: type, new: type) -> None:
+    """Updates a class definition in-place."""
+    self._type_updates[old] = new
+
+    # Get all attribute names from both old and new class
+    old_attrs = set(old.__dict__.keys())
+    new_attrs = set(new.__dict__.keys())
+
+    # Remove obsolete attributes
+    for attr in old_attrs - new_attrs:
+      if attr.startswith('__') and attr.endswith('__'):
+        continue  # Skip dunder attributes
+      try:
+        delattr(old, attr)
+      except (AttributeError, TypeError):
+        pass
+
+    # Update existing and add new attributes
+    for attr in new_attrs:
+      if attr in ('__dict__', '__weakref__'):
+        continue
+
+      try:
+        new_val = getattr(new, attr)
+      except AttributeError:
+        continue
+
+      # Recursively update nested functions/methods
+      if attr in old_attrs:
+        try:
+          old_val = getattr(old, attr)
+          self.update(old_val, new_val)
+        except AttributeError:
+          pass
+
+      # Set the new value on the old class
+      try:
+        setattr(old, attr, new_val)
+      except (AttributeError, TypeError):
+        pass
+
+  def _update_enum(self, old: type, new: type) -> None:
+    """Updates enum types with special equality handling.
+
+    After reloading, old and new enum singletons no longer match via `is`.
+    We patch __eq__ to compare by class name and member name instead.
+    """
+    self._update_class(old, new)
+
+    # Patch __eq__ to handle comparisons between old and new enum values
+    original_eq = new.__eq__
+
+    def enum_eq(self_enum, other):
+      result = original_eq(self_enum, other)
+      if result is NotImplemented:
+        # Fall back to comparing by class name and member name
+        if hasattr(other, '__class__') and hasattr(other, 'name'):
+          same_class = (
+              self_enum.__class__.__name__ == other.__class__.__name__
+              and self_enum.__class__.__module__ == other.__class__.__module__
+          )
+          return same_class and self_enum.name == other.name
+        return self_enum is other
+      return result
+
+    try:
+      new.__eq__ = enum_eq
+      old.__eq__ = enum_eq
+    except (AttributeError, TypeError):
+      pass
+
+  def _update_property(self, old: property, new: property) -> None:
+    """Updates a property's getter, setter, and deleter functions."""
+    if old.fget is not None and new.fget is not None:
+      self._update_function(old.fget, new.fget)
+    if old.fset is not None and new.fset is not None:
+      self._update_function(old.fset, new.fset)
+    if old.fdel is not None and new.fdel is not None:
+      self._update_function(old.fdel, new.fdel)
+
+  def update_instances(self) -> None:
+    """Updates all instances of old classes to use new class definitions.
+
+    Uses gc.get_referrers() to find all instances of updated classes
+    and changes their __class__ to the new class.
+    """
+    if not self._type_updates:
+      return
+
+    # Collect garbage first to avoid updating dead objects
+    gc.collect()
+
+    # Find all objects that reference the old types
+    refs = gc.get_referrers(*self._type_updates.keys())
+    for ref in refs:
+      ref_type = type(ref)
+      if ref_type in self._type_updates:
+        new_type = self._type_updates[ref_type]
+        try:
+          object.__setattr__(ref, '__class__', new_type)
+        except (AttributeError, TypeError):
+          pass
+
+
+def _update_module_references(
+    module: types.ModuleType,
+    original_members: Mapping[str, Any],
+    updated_members: Mapping[str, Any],
+) -> dict[str, list[str]]:
+  """Updates references to patched members in other loaded modules.
+
+  When a module is patched after being imported by other modules, those
+  other modules may have stale references to the original members. This
+  function finds and updates those references.
+
+  Args:
+    module: The module that was patched.
+    original_members: Mapping of member names to original objects.
+    updated_members: Mapping of member names to patched objects.
+
+  Returns:
+    A dict mapping module names to lists of attribute names that were updated.
+  """
+  updated_refs: dict[str, list[str]] = {}
+  module_name = module.__name__
+
+  for other_name, other_module in list(sys.modules.items()):
+    if other_module is None or other_module is module:
+      continue
+    if other_name == module_name:
+      continue
+
+    try:
+      other_dict = vars(other_module)
+    except TypeError:
+      continue
+
+    for member_name, original in original_members.items():
+      updated = updated_members[member_name]
+
+      # Check if this module has a reference to the original member
+      for attr_name, attr_val in list(other_dict.items()):
+        if attr_val is original:
+          try:
+            setattr(other_module, attr_name, updated)
+            if other_name not in updated_refs:
+              updated_refs[other_name] = []
+            updated_refs[other_name].append(attr_name)
+          except (AttributeError, TypeError):
+            pass
+
+  return updated_refs
+
+
 _INSTALLED_PATCHER_CONTEXTS = dict['ModuleASTPatcher', ContextManager[None]]()
 
 
@@ -76,8 +304,9 @@ class ModuleASTPatcher(Callable[[], ContextManager[None]]):
   blocks in alternating (before1, after1, before2, after2) order.
 
   The patcher may then be used as a `with patcher():` context manager, or using
-  `patcher.install()` or `patcher.install_clean()`. These are in increasing
-  order of robustness, and decreasing order of flexibility:
+  `patcher.install()`, `patcher.install_clean()`, or `patcher.install_inplace()`.
+  These are in increasing order of robustness, and decreasing order of
+  flexibility:
     * the `patcher()` context manager is flexible and useful for prototyping or
       debugging, but it changes and unchanges the target module, which isn't
       threadsafe.
@@ -87,6 +316,11 @@ class ModuleASTPatcher(Callable[[], ContextManager[None]]):
     * `install()` is between the two. It's threadsafe, and can be called at any
       time by downstream code, but may occasionally produce incorrect results
       due to aliasing by other modules.
+    * `install_inplace()` is the most robust for already-loaded modules. It
+      updates existing function code objects, class definitions, and instances
+      in-place, similar to etils ecolab's adhoc `reload_mode=UPDATE_INPLACE`.
+      This ensures that existing references, instances, and imports all use the
+      patched code.
 
   NOTE: Patching a module on the source level may produce surprises additional
   to those implicitly mentioned above:
@@ -162,6 +396,91 @@ class ModuleASTPatcher(Callable[[], ContextManager[None]]):
     if not isinstance(self.module, str) or self.module in sys.modules:
       raise ValueError(f'Module {self.module} already imported.')
     self.install()
+
+  def install_inplace(
+      self,
+      *,
+      update_instances: bool = True,
+      update_module_refs: bool = True,
+  ) -> dict[str, Any]:
+    """Installs patches and updates existing objects in-place.
+
+    This is the most robust way to patch an already-loaded module. Unlike
+    `install()` which uses mock.patch.object, this method actually updates
+    the original function code objects, class definitions, and their instances
+    in-place. This means:
+
+    1. Existing references to patched functions will use the new code.
+    2. Existing instances of patched classes will use the new class definition.
+    3. Other modules that imported the patched members will be updated.
+    4. Enum values will compare equal between old and new versions.
+
+    Similar to etils ecolab's adhoc `reload_mode=UPDATE_INPLACE`.
+
+    Args:
+      update_instances: If True, update all existing instances of patched
+        classes to use the new class definition via gc.get_referrers().
+      update_module_refs: If True, update references to patched members in
+        other loaded modules.
+
+    Returns:
+      A dict with information about what was updated:
+        - 'updated_members': List of member names that were updated.
+        - 'updated_modules': Dict mapping module names to lists of attribute
+          names that were updated in those modules.
+
+    Usage:
+      # Module already imported elsewhere
+      import some_module
+
+      # Create instances before patching
+      instance = some_module.MyClass()
+
+      # Patch with in-place updates
+      patcher = ModuleASTPatcher(some_module, MyClass=['old_code', 'new_code'])
+      result = patcher.install_inplace()
+
+      # instance now uses the new code!
+      instance.method()  # Uses patched version
+
+    NOTE: This is more aggressive than `install()` - it mutates the original
+    objects. This is generally what you want when patching already-loaded
+    modules, but be aware that:
+    - The changes cannot be easily reverted (unlike the context manager).
+    - If patching fails partway through, some objects may be partially updated.
+    """
+    # First, do the regular install to set up updated_members
+    self.install()
+
+    result: dict[str, Any] = {
+        'updated_members': list(self._patches_per_object.keys()),
+        'updated_modules': {},
+    }
+
+    # Ensure module is resolved
+    if isinstance(self.module, str):
+      self.module = importlib.import_module(self.module)
+
+    # Create updater for in-place modifications
+    updater = InPlaceUpdater()
+
+    # Update each patched member in-place
+    for name in self._patches_per_object:
+      original = self.original_members[name]
+      updated = self.updated_members[name]
+      updater.update(original, updated)
+
+    # Update instances of patched classes
+    if update_instances:
+      updater.update_instances()
+
+    # Update references in other modules
+    if update_module_refs:
+      result['updated_modules'] = _update_module_references(
+          self.module, self.original_members, self.updated_members
+      )
+
+    return result
 
   @contextlib.contextmanager
   def __call__(self):

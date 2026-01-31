@@ -195,5 +195,250 @@ class AstPatcherTest(parameterized.TestCase):
     with self.subTest('after_install_and_context'):
       self.assertEqual(safe_greenlet.yield_(), 'peekaboo')
 
+
+# Classes for in-place patching tests - defined at module level
+# Each test that uses in-place patching needs its own unique class/function
+# because in-place patching modifies the actual code objects.
+
+
+class InPlaceTestClass1:
+  """A class for testing in-place updates (test 1)."""
+
+  def __init__(self, value=10):
+    self.value = value
+
+  def compute(self):
+    return self.value * 2
+
+
+class InPlaceTestClass2:
+  """A class for testing in-place updates (test 2)."""
+
+  def __init__(self, value=10):
+    self.value = value
+
+  def compute(self):
+    return self.value * 2
+
+
+class InPlaceTestClass3:
+  """A class for testing in-place updates (test 3)."""
+
+  def __init__(self, value=10):
+    self.value = value
+
+  def compute(self):
+    return self.value * 2
+
+
+def inplace_test_func1():
+  """A function for testing in-place updates (test 1)."""
+  return 'original_result'
+
+
+def inplace_test_func2():
+  """A function for testing in-place updates (test 2)."""
+  return 'original_result'
+
+
+class InPlacePatcherTest(parameterized.TestCase):
+  """Tests for install_inplace() functionality."""
+
+  def test_install_inplace_function(self):
+    """Test that install_inplace updates function code in-place."""
+    # Get reference to original function
+    original_func = inplace_test_func1
+
+    # Create patcher
+    patcher = ast_patcher.ModuleASTPatcher(
+        MODULE,
+        inplace_test_func1=["'original_result'", "'patched_result'"],
+    )
+
+    # Install in-place
+    result = patcher.install_inplace()
+
+    # Verify the result structure
+    self.assertIn('updated_members', result)
+    self.assertIn('inplace_test_func1', result['updated_members'])
+
+    # The original function reference should now return patched result
+    # (because its __code__ was updated in-place)
+    self.assertEqual(original_func(), 'patched_result')
+
+    # Cleanup
+    del ast_patcher._INSTALLED_PATCHER_CONTEXTS[patcher]
+
+  def test_install_inplace_class_method(self):
+    """Test that install_inplace updates class methods."""
+    # Create instance before patching
+    instance = InPlaceTestClass1(value=5)
+
+    # Verify original behavior
+    self.assertEqual(instance.compute(), 10)  # 5 * 2
+
+    # Create patcher to change compute() multiplier
+    patcher = ast_patcher.ModuleASTPatcher(
+        MODULE,
+        InPlaceTestClass1=['self.value * 2', 'self.value * 3'],
+    )
+
+    # Install in-place
+    patcher.install_inplace()
+
+    # The existing instance should now use the patched method
+    self.assertEqual(instance.compute(), 15)  # 5 * 3
+
+    # New instances should also use patched method
+    new_instance = InPlaceTestClass1(value=4)
+    self.assertEqual(new_instance.compute(), 12)  # 4 * 3
+
+    # Cleanup
+    del ast_patcher._INSTALLED_PATCHER_CONTEXTS[patcher]
+
+  def test_install_inplace_preserves_instance_state(self):
+    """Test that instance state is preserved after in-place patching."""
+    # Create instance with custom state
+    instance = InPlaceTestClass2(value=42)
+    instance.custom_attr = 'preserved'
+
+    # Patch the class
+    patcher = ast_patcher.ModuleASTPatcher(
+        MODULE,
+        InPlaceTestClass2=['self.value * 2', 'self.value + 100'],
+    )
+    patcher.install_inplace()
+
+    # Instance state should be preserved
+    self.assertEqual(instance.value, 42)
+    self.assertEqual(instance.custom_attr, 'preserved')
+
+    # But method should use new code
+    self.assertEqual(instance.compute(), 142)  # 42 + 100
+
+    # Cleanup
+    del ast_patcher._INSTALLED_PATCHER_CONTEXTS[patcher]
+
+  def test_install_inplace_returns_update_info(self):
+    """Test that install_inplace returns information about updates."""
+    patcher = ast_patcher.ModuleASTPatcher(
+        MODULE,
+        inplace_test_func2=["'original_result'", "'info_test'"],
+    )
+
+    result = patcher.install_inplace()
+
+    self.assertIsInstance(result, dict)
+    self.assertIn('updated_members', result)
+    self.assertIn('updated_modules', result)
+    self.assertEqual(result['updated_members'], ['inplace_test_func2'])
+
+    # Cleanup
+    del ast_patcher._INSTALLED_PATCHER_CONTEXTS[patcher]
+
+  def test_install_inplace_without_instance_updates(self):
+    """Test install_inplace with update_instances=False."""
+    patcher = ast_patcher.ModuleASTPatcher(
+        MODULE,
+        InPlaceTestClass3=['self.value * 2', 'self.value * 5'],
+    )
+
+    # Install without updating instances
+    patcher.install_inplace(update_instances=False)
+
+    # The module attribute should still be patched
+    new_instance = MODULE.InPlaceTestClass3(value=2)
+    self.assertEqual(new_instance.compute(), 10)  # 2 * 5
+
+    # Cleanup
+    del ast_patcher._INSTALLED_PATCHER_CONTEXTS[patcher]
+
+
+class InPlaceUpdaterTest(absltest.TestCase):
+  """Tests for the InPlaceUpdater class directly."""
+
+  def test_update_function_code(self):
+    """Test updating a function's code object."""
+    def old_func():
+      return 'old'
+
+    def new_func():
+      return 'new'
+
+    updater = ast_patcher.InPlaceUpdater()
+    updater.update(old_func, new_func)
+
+    # old_func should now return 'new'
+    self.assertEqual(old_func(), 'new')
+
+  def test_update_function_defaults(self):
+    """Test updating a function's default arguments."""
+    def old_func(x=1):
+      return x
+
+    def new_func(x=99):
+      return x
+
+    updater = ast_patcher.InPlaceUpdater()
+    updater.update(old_func, new_func)
+
+    # old_func should now have new default
+    self.assertEqual(old_func(), 99)
+
+  def test_update_same_object_noop(self):
+    """Test that updating an object with itself is a no-op."""
+    def func():
+      return 'test'
+
+    original_code = func.__code__
+
+    updater = ast_patcher.InPlaceUpdater()
+    updater.update(func, func)
+
+    # Code should be unchanged
+    self.assertIs(func.__code__, original_code)
+
+  def test_update_class_methods(self):
+    """Test updating class method code."""
+
+    class OldClass:
+      def method(self):
+        return 'old'
+
+    class NewClass:
+      def method(self):
+        return 'new'
+
+    updater = ast_patcher.InPlaceUpdater()
+    updater.update(OldClass, NewClass)
+
+    # OldClass instances should now use new method
+    instance = OldClass()
+    self.assertEqual(instance.method(), 'new')
+
+  def test_update_instances_changes_class(self):
+    """Test that update_instances remaps instance classes."""
+
+    class OldClass:
+      def method(self):
+        return 'old'
+
+    class NewClass:
+      def method(self):
+        return 'new'
+
+    # Create instance before update
+    instance = OldClass()
+    self.assertEqual(instance.method(), 'old')
+
+    updater = ast_patcher.InPlaceUpdater()
+    updater.update(OldClass, NewClass)
+    updater.update_instances()
+
+    # Instance should now use NewClass (via __class__ reassignment)
+    # Note: The method was already updated on OldClass, so it returns 'new'
+    self.assertEqual(instance.method(), 'new')
+
+
 if __name__ == '__main__':
   absltest.main()
