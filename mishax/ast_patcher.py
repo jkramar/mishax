@@ -61,6 +61,31 @@ def _ast_undump(dumped_ast: str) -> ast.AST:
 _INSTALLED_PATCHER_CONTEXTS = dict['ModuleASTPatcher', ContextManager[None]]()
 
 
+def _set_module_attr(obj: object, module_name: str) -> None:
+  """Sets __module__ on obj and, for classes, recursively on members."""
+  if isinstance(obj, type):
+    obj.__module__ = module_name
+    for name, value in vars(obj).items():
+      if isinstance(value, (types.FunctionType, types.MethodType, property)):
+        _set_module_attr(value, module_name)
+      elif isinstance(value, classmethod):
+        _set_module_attr(value.__func__, module_name)
+      elif isinstance(value, staticmethod):
+        _set_module_attr(value.__func__, module_name)
+      elif isinstance(value, type):
+        # Nested class
+        _set_module_attr(value, module_name)
+  elif isinstance(obj, types.FunctionType):
+    obj.__module__ = module_name
+  elif isinstance(obj, property):
+    if obj.fget is not None:
+      _set_module_attr(obj.fget, module_name)
+    if obj.fset is not None:
+      _set_module_attr(obj.fset, module_name)
+    if obj.fdel is not None:
+      _set_module_attr(obj.fdel, module_name)
+
+
 class ModuleASTPatcher(Callable[[], ContextManager[None]]):
   """Creates a patcher that applies a series of patches to a module.
 
@@ -102,6 +127,18 @@ class ModuleASTPatcher(Callable[[], ContextManager[None]]):
   2. If the target module member definitions change global state (e.g. by
   registering themselves somewhere) then that state change will happen again
   when the patch is applied.
+
+  Args:
+    module: The module to patch (either a module object or module name string).
+    settings: PatchSettings instance for configuring patch behavior.
+    overlay_name: If provided, creates an overlay module with this name that
+      contains the patched members. The patched objects will have their
+      __module__ attribute set to this name, making them picklable with a
+      stable identity. When unpickled, they will resolve to the patched version
+      if the same overlay module exists (i.e., the same patcher was set up),
+      or fail to import if not. This allows distinguishing between pickled
+      patched and unpatched objects.
+    **patches_per_object: Patches to apply to each module member.
   """
 
   def __init__(
@@ -109,16 +146,20 @@ class ModuleASTPatcher(Callable[[], ContextManager[None]]):
       module: types.ModuleType | str,
       settings: PatchSettings = PatchSettings(),
       /,
+      *,
+      overlay_name: str | None = None,
       **patches_per_object: str | Sequence[str] | Sequence[tuple[str, str]],
   ):
     self.module = module
     self._settings = settings
+    self._overlay_name = overlay_name
     self._patches_per_object = patches_per_object
     self._updated_members = None
     self._original_members = None
     self._src = None
     self._path = None
     self._globals = None
+    self._overlay_module = None
     if not isinstance(self.module, str):
       self._updated_members = self.updated_members
 
@@ -209,6 +250,28 @@ class ModuleASTPatcher(Callable[[], ContextManager[None]]):
       self._setup()
     self._path: str
     return self._path
+
+  @property
+  def overlay_name(self) -> str | None:
+    """Returns the overlay module name, if one was specified."""
+    return self._overlay_name
+
+  @property
+  def overlay_module(self) -> types.ModuleType | None:
+    """Returns the overlay module, if one was specified.
+
+    The overlay module is a synthetic module registered in sys.modules that
+    contains the patched members with their __module__ attribute set to the
+    overlay module's name. This allows pickling patched objects with a stable
+    identity that can be resolved on unpickling if the same patcher has been
+    set up.
+    """
+    if self._overlay_name is None:
+      return None
+    if self._overlay_module is None:
+      self._setup()
+    self._overlay_module: types.ModuleType
+    return self._overlay_module
 
   def _setup(self):
     """Sets up the patcher source and temporary file."""
@@ -305,3 +368,18 @@ class ModuleASTPatcher(Callable[[], ContextManager[None]]):
     self._globals = envt
     updated_members = {name: envt[name] for name in self._patches_per_object}
     self._updated_members = immutabledict.immutabledict(updated_members)
+    # Create overlay module if overlay_name was specified.
+    if self._overlay_name is not None:
+      # Create or reuse existing overlay module.
+      if self._overlay_name in sys.modules:
+        self._overlay_module = sys.modules[self._overlay_name]
+      else:
+        self._overlay_module = types.ModuleType(self._overlay_name)
+        sys.modules[self._overlay_name] = self._overlay_module
+      # Populate the overlay module with the globals (which includes updated
+      # members and everything they need from the target module).
+      self._overlay_module.__dict__.update(envt)
+      # Set __module__ on the updated members to point at the overlay module,
+      # so that pickling will use the overlay module name.
+      for member in updated_members.values():
+        _set_module_attr(member, self._overlay_name)
