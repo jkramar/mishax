@@ -34,13 +34,14 @@ import weakref
 
 import immutabledict
 
-# Try to use etils ecolab's in-place updater if available.
-# This provides well-tested object update functionality.
+# etils ecolab provides the in-place object updater for install_inplace().
 try:
-  from etils.ecolab.inplace_reload import _ObjectUpdater as _EtilsObjectUpdater
-  _ETILS_AVAILABLE = True
+  from etils.ecolab import inplace_reload as _etils_inplace_reload
+  # Expose the updater class for direct use (e.g., in tests)
+  InPlaceUpdater = _etils_inplace_reload._ObjectUpdater
 except ImportError:
-  _ETILS_AVAILABLE = False
+  _etils_inplace_reload = None
+  InPlaceUpdater = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -66,125 +67,6 @@ class PatchError(ValueError):
 def _ast_undump(dumped_ast: str) -> ast.AST:
   """Inverse of ast.dump."""
   return eval(dumped_ast, vars(ast) | vars(builtins))  # pylint: disable=eval-used
-
-
-class _FallbackObjectUpdater:
-  """Fallback implementation when etils is not available.
-
-  Updates Python objects in-place to use new code without changing identity.
-  Based on etils.ecolab.inplace_reload._ObjectUpdater.
-  """
-
-  def __init__(self):
-    self._type_updates: dict[type, type] = {}
-
-  def update(self, old: Any, new: Any) -> None:
-    """Updates an object in-place to use new code/definition."""
-    if old is new:
-      return
-
-    match old, new:
-      case enum.EnumType(), enum.EnumType():
-        self._update_enum(old, new)
-      case type(), type():
-        self._update_class(old, new)
-      case types.FunctionType(), types.FunctionType():
-        self._update_function(old, new)
-      case types.MethodType(), types.MethodType():
-        self._update_function(old.__func__, new.__func__)
-      case property(), property():
-        self._update_property(old, new)
-
-  def _update_function(
-      self, old: types.FunctionType, new: types.FunctionType
-  ) -> None:
-    """Updates a function's code object and attributes in-place."""
-    for attr in [
-        '__code__',
-        '__defaults__',
-        '__doc__',
-        '__dict__',
-        '__annotations__',
-        '__kwdefaults__',
-    ]:
-      try:
-        setattr(old, attr, getattr(new, attr))
-      except (AttributeError, TypeError, ValueError):
-        pass
-
-  def _update_class(self, old: type, new: type) -> None:
-    """Updates a class definition in-place."""
-    self._type_updates[old] = new
-
-    for key in list(old.__dict__.keys()):
-      old_obj = getattr(old, key)
-      try:
-        new_obj = getattr(new, key)
-      except AttributeError:
-        # Obsolete attribute: remove it
-        try:
-          delattr(old, key)
-        except (AttributeError, TypeError):
-          pass
-        continue
-
-      self.update(old_obj, new_obj)
-
-      try:
-        setattr(old, key, getattr(new, key))
-      except (AttributeError, TypeError):
-        pass
-
-  def _update_enum(self, old: type, new: type) -> None:
-    """Updates enum types with special equality handling."""
-    self._update_class(old, new)
-
-    cur_eq = new.__eq__
-
-    def enum_eq(x, y):
-      eq = cur_eq(x, y)
-      if eq == NotImplemented:
-        return x is y or (x.__class__ == y.__class__ and x.name == y.name)
-      return eq
-
-    try:
-      new.__eq__ = enum_eq
-    except (AttributeError, TypeError):
-      pass
-
-  def _update_property(self, old: property, new: property) -> None:
-    """Updates a property's getter, setter, and deleter functions."""
-    if old.fget is not None and new.fget is not None:
-      self._update_function(old.fget, new.fget)
-    if old.fset is not None and new.fset is not None:
-      self._update_function(old.fset, new.fset)
-    if old.fdel is not None and new.fdel is not None:
-      self._update_function(old.fdel, new.fdel)
-
-  def update_instances(self) -> None:
-    """Updates all instances of old classes to use new class definitions."""
-    if not self._type_updates:
-      return
-
-    gc.collect()
-    refs = gc.get_referrers(*self._type_updates.keys())
-    for ref in refs:
-      if (new := self._type_updates.get(type(ref))) is not None:
-        try:
-          object.__setattr__(ref, '__class__', new)
-        except (AttributeError, TypeError):
-          pass
-
-
-def _get_object_updater():
-  """Returns an object updater instance, preferring etils if available."""
-  if _ETILS_AVAILABLE:
-    return _EtilsObjectUpdater()
-  return _FallbackObjectUpdater()
-
-
-# Alias for backwards compatibility and documentation
-InPlaceUpdater = _FallbackObjectUpdater if not _ETILS_AVAILABLE else _EtilsObjectUpdater
 
 
 def _update_module_references(
@@ -399,7 +281,15 @@ class ModuleASTPatcher(Callable[[], ContextManager[None]]):
     modules, but be aware that:
     - The changes cannot be easily reverted (unlike the context manager).
     - If patching fails partway through, some objects may be partially updated.
+
+    Raises:
+      ImportError: If etils is not installed. This feature requires etils.
     """
+    if _etils_inplace_reload is None:
+      raise ImportError(
+          'install_inplace() requires etils. Install with: pip install etils'
+      )
+
     # First, do the regular install to set up updated_members
     self.install()
 
@@ -412,8 +302,8 @@ class ModuleASTPatcher(Callable[[], ContextManager[None]]):
     if isinstance(self.module, str):
       self.module = importlib.import_module(self.module)
 
-    # Create updater for in-place modifications
-    updater = _get_object_updater()
+    # Create updater for in-place modifications using etils
+    updater = _etils_inplace_reload._ObjectUpdater()
 
     # Update each patched member in-place
     for name in self._patches_per_object:
