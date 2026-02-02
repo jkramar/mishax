@@ -34,6 +34,14 @@ import weakref
 
 import immutabledict
 
+# Try to use etils ecolab's in-place updater if available.
+# This provides well-tested object update functionality.
+try:
+  from etils.ecolab.inplace_reload import _ObjectUpdater as _EtilsObjectUpdater
+  _ETILS_AVAILABLE = True
+except ImportError:
+  _ETILS_AVAILABLE = False
+
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PatchSettings:
@@ -60,39 +68,18 @@ def _ast_undump(dumped_ast: str) -> ast.AST:
   return eval(dumped_ast, vars(ast) | vars(builtins))  # pylint: disable=eval-used
 
 
-class InPlaceUpdater:
-  """Updates Python objects in-place to use new code without changing identity.
+class _FallbackObjectUpdater:
+  """Fallback implementation when etils is not available.
 
-  This enables seamless patching of already-loaded modules by updating existing
-  function code objects, class definitions, and instances to use new patched
-  versions while maintaining object identity.
-
-  Similar to etils ecolab's adhoc in-place reload mode, this handles:
-  - Functions: Updates __code__, __defaults__, __doc__, __dict__, __annotations__
-  - Classes: Updates methods, class attributes, and remaps instances
-  - Enums: Special handling to make old and new enum values compare equal
-  - Properties: Updates fget, fset, fdel functions
-  - Methods: Unwraps to function and updates
-
-  Usage:
-    updater = InPlaceUpdater()
-    for name in ['func1', 'MyClass']:
-      old_obj = getattr(module, name)
-      new_obj = patched_members[name]
-      updater.update(old_obj, new_obj)
-    updater.update_instances()  # Remap all instances to new classes
+  Updates Python objects in-place to use new code without changing identity.
+  Based on etils.ecolab.inplace_reload._ObjectUpdater.
   """
 
   def __init__(self):
     self._type_updates: dict[type, type] = {}
 
   def update(self, old: Any, new: Any) -> None:
-    """Updates an object in-place to use new code/definition.
-
-    Args:
-      old: The original object to update.
-      new: The new object with updated code/definition.
-    """
+    """Updates an object in-place to use new code/definition."""
     if old is new:
       return
 
@@ -121,85 +108,47 @@ class InPlaceUpdater:
         '__kwdefaults__',
     ]:
       try:
-        new_val = getattr(new, attr)
-        setattr(old, attr, new_val)
+        setattr(old, attr, getattr(new, attr))
       except (AttributeError, TypeError, ValueError):
         pass
-
-    # Update __globals__ by clearing and updating the dict
-    # Note: We can't reassign __globals__ directly as it's read-only,
-    # but we can update the dict in-place if it's the same dict.
-    # For AST patching, the new function has different globals, so we
-    # need to be careful here - we update only the code object.
 
   def _update_class(self, old: type, new: type) -> None:
     """Updates a class definition in-place."""
     self._type_updates[old] = new
 
-    # Get all attribute names from both old and new class
-    old_attrs = set(old.__dict__.keys())
-    new_attrs = set(new.__dict__.keys())
-
-    # Remove obsolete attributes
-    for attr in old_attrs - new_attrs:
-      if attr.startswith('__') and attr.endswith('__'):
-        continue  # Skip dunder attributes
+    for key in list(old.__dict__.keys()):
+      old_obj = getattr(old, key)
       try:
-        delattr(old, attr)
-      except (AttributeError, TypeError):
-        pass
-
-    # Update existing and add new attributes
-    for attr in new_attrs:
-      if attr in ('__dict__', '__weakref__'):
-        continue
-
-      try:
-        new_val = getattr(new, attr)
+        new_obj = getattr(new, key)
       except AttributeError:
+        # Obsolete attribute: remove it
+        try:
+          delattr(old, key)
+        except (AttributeError, TypeError):
+          pass
         continue
 
-      # Recursively update nested functions/methods
-      if attr in old_attrs:
-        try:
-          old_val = getattr(old, attr)
-          self.update(old_val, new_val)
-        except AttributeError:
-          pass
+      self.update(old_obj, new_obj)
 
-      # Set the new value on the old class
       try:
-        setattr(old, attr, new_val)
+        setattr(old, key, getattr(new, key))
       except (AttributeError, TypeError):
         pass
 
   def _update_enum(self, old: type, new: type) -> None:
-    """Updates enum types with special equality handling.
-
-    After reloading, old and new enum singletons no longer match via `is`.
-    We patch __eq__ to compare by class name and member name instead.
-    """
+    """Updates enum types with special equality handling."""
     self._update_class(old, new)
 
-    # Patch __eq__ to handle comparisons between old and new enum values
-    original_eq = new.__eq__
+    cur_eq = new.__eq__
 
-    def enum_eq(self_enum, other):
-      result = original_eq(self_enum, other)
-      if result is NotImplemented:
-        # Fall back to comparing by class name and member name
-        if hasattr(other, '__class__') and hasattr(other, 'name'):
-          same_class = (
-              self_enum.__class__.__name__ == other.__class__.__name__
-              and self_enum.__class__.__module__ == other.__class__.__module__
-          )
-          return same_class and self_enum.name == other.name
-        return self_enum is other
-      return result
+    def enum_eq(x, y):
+      eq = cur_eq(x, y)
+      if eq == NotImplemented:
+        return x is y or (x.__class__ == y.__class__ and x.name == y.name)
+      return eq
 
     try:
       new.__eq__ = enum_eq
-      old.__eq__ = enum_eq
     except (AttributeError, TypeError):
       pass
 
@@ -213,27 +162,29 @@ class InPlaceUpdater:
       self._update_function(old.fdel, new.fdel)
 
   def update_instances(self) -> None:
-    """Updates all instances of old classes to use new class definitions.
-
-    Uses gc.get_referrers() to find all instances of updated classes
-    and changes their __class__ to the new class.
-    """
+    """Updates all instances of old classes to use new class definitions."""
     if not self._type_updates:
       return
 
-    # Collect garbage first to avoid updating dead objects
     gc.collect()
-
-    # Find all objects that reference the old types
     refs = gc.get_referrers(*self._type_updates.keys())
     for ref in refs:
-      ref_type = type(ref)
-      if ref_type in self._type_updates:
-        new_type = self._type_updates[ref_type]
+      if (new := self._type_updates.get(type(ref))) is not None:
         try:
-          object.__setattr__(ref, '__class__', new_type)
+          object.__setattr__(ref, '__class__', new)
         except (AttributeError, TypeError):
           pass
+
+
+def _get_object_updater():
+  """Returns an object updater instance, preferring etils if available."""
+  if _ETILS_AVAILABLE:
+    return _EtilsObjectUpdater()
+  return _FallbackObjectUpdater()
+
+
+# Alias for backwards compatibility and documentation
+InPlaceUpdater = _FallbackObjectUpdater if not _ETILS_AVAILABLE else _EtilsObjectUpdater
 
 
 def _update_module_references(
@@ -462,7 +413,7 @@ class ModuleASTPatcher(Callable[[], ContextManager[None]]):
       self.module = importlib.import_module(self.module)
 
     # Create updater for in-place modifications
-    updater = InPlaceUpdater()
+    updater = _get_object_updater()
 
     # Update each patched member in-place
     for name in self._patches_per_object:
